@@ -5,3 +5,4 @@
 //! - [`flex`] strives to facilitate transitioning from C.
 pub mod ergo;
 pub mod flex;
+pub mod idiomatic;

@@ -9,5 +9,6 @@ glib = { workspace = true }
 glib-sys = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-
 axevent-sys = { workspace = true }
+syn = "2.0.85"
+quote = "1.0.37"

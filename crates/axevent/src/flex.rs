@@ -13,7 +13,10 @@ use std::{
     ffi::{c_char, c_double, c_int, c_uint, c_void, CStr, CString},
     fmt::Debug,
     process, ptr,
-    sync::Mutex,
+    sync::{
+        mpsc::{Receiver, Sender},
+        Arc, Mutex,
+    },
 };
 
 use axevent_sys::{
@@ -101,52 +104,60 @@ impl Declaration {
     }
 }
 
-/// Please see the ACAP documentation for [`ax_event.sh`](https://axiscommunications.github.io/acap-documentation/docs/api/src/api/axevent/html/ax__event_8h.html).
-pub struct Event {
-    raw: *mut AXEvent,
-    // TODO: Considering using separate owned and borrowed key value set types.
-    // This is a hack to make it possible to hand out references.
-    key_value_set: KeyValueSet,
+// /// Please see the ACAP documentation for [`ax_event.sh`](https://axiscommunications.github.io/acap-documentation/docs/api/src/api/axevent/html/ax__event_8h.html).
+// pub struct Event {
+//     raw: *mut AXEvent,
+//     // TODO: Considering using separate owned and borrowed key value set types.
+//     // This is a hack to make it possible to hand out references.
+//     key_value_set: KeyValueSet,
+// }
+
+// pub trait Event {
+//     fn from_raw(raw: *mut AXEvent) -> Self
+//     where
+//         Self: Sized;
+
+//     fn new2(key_value_set: KeyValueSet, time_stamp: Option<DateTime>) -> Self
+//     where
+//         Self: Sized;
+
+//     fn key_value_set(&self) -> &KeyValueSet;
+
+//     fn time_stamp2(&self) -> DateTime;
+// }
+
+pub struct EventStream<T>
+where
+    T: Event,
+{
+    subscription: u32,
+    sender: Arc<Sender<T>>,
+    receiver: Receiver<T>,
 }
 
-impl Event {
-    fn from_raw(raw: *mut AXEvent) -> Self {
-        unsafe {
-            // Converting to `*mut` is safe as long as we ensure that none of the mutable methods on
-            // `KeyValueSet` are called, which we do by never handing out a mutable reference to the
-            // `KeyValueSet`.
-            let key_value_set = KeyValueSet::from_raw(ax_event_get_key_value_set(raw) as *mut _);
-            Self { raw, key_value_set }
-        }
+impl<T> EventStream<T>
+where
+    T: Event,
+{
+    pub unsafe extern "C" fn callback<E>(
+        sub_id: c_uint,
+        raw_event: *mut AXEvent,
+        user_data: gpointer,
+    ) where
+        E: Event,
+    {
+        let event = E::from(raw_event);
+        let tx = unsafe { &mut *(user_data as *mut Sender<E>) };
+        tx.send(event);
     }
 
-    pub fn new2(key_value_set: KeyValueSet, time_stamp: Option<DateTime>) -> Self {
-        unsafe {
-            let raw = ax_event_new2(key_value_set.raw, time_stamp.into_glib_ptr());
-            Self { raw, key_value_set }
-        }
-    }
-
-    pub fn key_value_set(&self) -> &KeyValueSet {
-        &self.key_value_set
-    }
-
-    pub fn time_stamp2(&self) -> DateTime {
-        unsafe { from_glib_none(ax_event_get_time_stamp2(self.raw)) }
-    }
+    fn unsubscribe() {}
 }
 
-impl Drop for Event {
-    fn drop(&mut self) {
-        debug!("Dropping {}", any::type_name::<Self>());
-        self.key_value_set.raw = ptr::null_mut();
-        unsafe {
-            ax_event_free(self.raw);
-        }
-    }
+pub trait Event: From<*mut AXEvent> {
+    fn get_key_value_set(&self) -> &KeyValueSet;
+    fn get_base_key_value_set() -> Result<KeyValueSet>;
 }
-
-unsafe impl Send for Event {}
 
 /// Please see the ACAP documentation for [`ax_event_handler.h`](https://axiscommunications.github.io/acap-documentation/docs/api/src/api/axevent/html/ax__event__handler_8h.html).
 pub struct Handler {
@@ -285,31 +296,60 @@ impl Handler {
         }
     }
 
-    pub fn subscribe<F>(&self, key_value_set: KeyValueSet, callback: F) -> Result<Subscription>
+    // pub fn subscribe<F>(&self, key_value_set: KeyValueSet, callback: F) -> Result<Subscription>
+    // where
+    //     F: FnMut(Subscription, Box<dyn Event>) + Send + 'static,
+    // {
+    //     let callback = Box::into_raw(Box::new(callback));
+    //     unsafe {
+    //         let mut subscription = c_uint::default();
+    //         try_func!(
+    //             ax_event_handler_subscribe,
+    //             self.raw,
+    //             key_value_set.raw,
+    //             &mut subscription,
+    //             Some(Subscription::handle_callback::<F>),
+    //             callback as *mut c_void,
+    //         )?;
+
+    //         let handle = Subscription(subscription);
+
+    //         self.subscription_callbacks
+    //             .lock()
+    //             .unwrap()
+    //             .insert(handle, Deferred::new(move || drop(Box::from_raw(callback))));
+
+    //         Ok(handle)
+    //     }
+    // }
+    pub fn subscribe<T, F>(&self, f: F) -> Result<EventStream>
     where
-        F: FnMut(Subscription, Event) + Send + 'static,
+        F: FnOnce(Receiver<T>),
+        T: Event,
     {
-        let callback = Box::into_raw(Box::new(callback));
-        unsafe {
-            let mut subscription = c_uint::default();
-            try_func!(
-                ax_event_handler_subscribe,
+        let kv_set = T::get_base_key_value_set()?;
+        let (tx, rx) = std::sync::mpsc::channel::<T>();
+        let tx_ptr = Arc::new(tx);
+        let mut event_stream: EventStream<T> = EventStream {
+            subscription: 0,
+            sender: tx,
+            receiver: rx,
+        };
+        // let event_sender = move unsafe extern "C" |sub_id, raw_event, user_data| {};
+        let mut error: *mut GError = ptr::null_mut();
+        let success = unsafe {
+            ax_event_handler_subscribe(
                 self.raw,
-                key_value_set.raw,
-                &mut subscription,
-                Some(Subscription::handle_callback::<F>),
-                callback as *mut c_void,
-            )?;
-
-            let handle = Subscription(subscription);
-
-            self.subscription_callbacks
-                .lock()
-                .unwrap()
-                .insert(handle, Deferred::new(move || drop(Box::from_raw(callback))));
-
-            Ok(handle)
-        }
+                kv_set.raw,
+                &mut event_stream.subscription,
+                Some(EventStream::callback::<T>),
+                &mut event_stream.sender as *mut _ as *mut c_void,
+                &mut error,
+            );
+            try_into_unit(success, error)
+        };
+        f(rx);
+        Ok(event_stream)
     }
 
     pub fn unsubscribe(&self, subscription: &Subscription) -> Result<()> {
@@ -594,24 +634,24 @@ unsafe impl Send for KeyValueSet {}
 
 type Result<T> = core::result::Result<T, Error>;
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub struct Subscription(u32);
+// #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+// pub struct Subscription(u32);
 
-impl Subscription {
-    unsafe extern "C" fn handle_callback<F>(
-        subscription: c_uint,
-        event: *mut AXEvent,
-        user_data: gpointer,
-    ) where
-        F: FnMut(Subscription, Event) + Send,
-    {
-        abort_unwind!(|| {
-            let callback = &mut *(user_data as *mut F);
-            let event = Event::from_raw(event);
-            callback(Subscription(subscription), event);
-        });
-    }
-}
+// impl Subscription {
+//     unsafe extern "C" fn handle_callback<F>(
+//         subscription: c_uint,
+//         event: *mut AXEvent,
+//         user_data: gpointer,
+//     ) where
+//         F: FnMut(Subscription, Box<dyn Event>) + Send,
+//     {
+//         abort_unwind!(|| {
+//             let callback = &mut *(user_data as *mut F);
+//             let event = Event::from_raw(event);
+//             callback(Subscription(subscription), event);
+//         });
+//     }
+// }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
