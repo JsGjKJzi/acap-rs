@@ -36,7 +36,7 @@
 //! # TODOs:
 //! - [ ] [larodDisconnect](https://axiscommunications.github.io/acap-documentation/docs/api/src/api/larod/html/larod_8h.html#ab8f97b4b4d15798384ca25f32ca77bba)
 //!     indicates it may fail to "kill a session." What are the implications if it fails to kill a session? Can we clear the sessions?
-
+use crate::inference::PrivateSupportedBackend;
 use core::slice;
 pub use larod_sys::larodAccess as LarodAccess;
 use larod_sys::*;
@@ -768,12 +768,45 @@ pub enum PreProcBackend {
     RemoteOpenCLDLPU,
     RemoteOpenCLGPU,
 }
+mod inference {
+    pub trait PrivateSupportedBackend {
+        fn as_str() -> &'static str;
+    }
+}
 
-#[derive(Debug, Default)]
-pub enum InferenceChip {
-    #[default]
-    TFLiteCPU,
-    TFLiteDLPU,
+// Marker types
+pub struct TFLite;
+pub struct CVFlowNN;
+pub struct Native;
+
+// Hardware types that specify which modes they support
+pub struct CPU;
+pub struct EdgeTPU;
+pub struct GPU;
+pub struct Artpec7GPU;
+pub struct Artpec8DLPU;
+pub struct Artpec9DLPU;
+pub struct ArmNNCPU;
+
+impl inference::PrivateSupportedBackend for (TFLite, CPU) {
+    fn as_str() -> &'static str {
+        "cpu-tflite"
+    }
+}
+impl inference::PrivateSupportedBackend for (TFLite, Artpec7GPU) {
+    fn as_str() -> &'static str {
+        "axis-a7-gpu-tflite"
+    }
+}
+impl inference::PrivateSupportedBackend for (TFLite, Artpec8DLPU) {
+    fn as_str() -> &'static str {
+        "axis-a8-dlpu-tflite"
+    }
+}
+impl inference::PrivateSupportedBackend for (TFLite, Artpec9DLPU) {
+    fn as_str() -> &'static str {
+        "a9-dlpu-tflite"
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1142,36 +1175,6 @@ impl<'a> Drop for JobRequest<'a> {
     }
 }
 
-// #[derive(Default)]
-// pub struct ModelBuilder {
-//     file_path: Option<PathBuf>,
-//     device: InferenceChip,
-//     crop: Option<(u32, u32, u32, u32)>,
-// }
-
-// impl ModelBuilder {
-//     pub fn new() -> Self {
-//         ModelBuilder::default()
-//     }
-
-//     pub fn source_file(mut self, path: PathBuf) -> Self {
-//         self.file_path = Some(path);
-//         self
-//     }
-
-//     pub fn on_chip(mut self, device: InferenceChip) -> Self {
-//         self.device = device;
-//         self
-//     }
-
-//     pub fn with_crop(mut self, crop: (u32, u32, u32, u32)) -> Self {
-//         self.crop = Some(crop);
-//         self
-//     }
-
-//     pub fn load(self, session: Session) -> Model {}
-// }
-
 pub struct InferenceModel<'a> {
     session: &'a Session,
     ptr: *mut larodModel,
@@ -1179,9 +1182,68 @@ pub struct InferenceModel<'a> {
     num_inputs: usize,
     output_tensors: Option<LarodTensorContainer<'a>>,
     num_outputs: usize,
+    params: Option<LarodMap>,
 }
 
 impl<'a> InferenceModel<'a> {
+    pub fn new<M, H, P>(
+        session: &'a Session,
+        model_file: P,
+        // chip: InferenceBackend<M, H>,
+        access: LarodAccess,
+        name: &str,
+        params: Option<LarodMap>,
+    ) -> Result<InferenceModel<'a>>
+    where
+        (M, H): inference::PrivateSupportedBackend,
+        P: AsRef<Path>,
+    {
+        let f = File::open(model_file).map_err(Error::IOError)?;
+        let Ok(device_name) = CString::new(<(M, H)>::as_str()) else {
+            return Err(Error::CStringAllocation);
+        };
+        let (device, maybe_device_error) =
+            unsafe { try_func!(larodGetDevice, session.conn, device_name.as_ptr(), 0) };
+        if !device.is_null() {
+            debug_assert!(
+                maybe_device_error.is_none(),
+                "larodGetDevice indicated success AND returned an error!"
+            );
+        } else {
+            return Err(maybe_device_error.unwrap_or(Error::MissingLarodError));
+        }
+        let Ok(name) = CString::new(name) else {
+            return Err(Error::CStringAllocation);
+        };
+        let (larod_model_ptr, maybe_error) = unsafe {
+            try_func!(
+                larodLoadModel,
+                session.conn,
+                f.as_raw_fd(),
+                device,
+                access,
+                name.as_ptr(),
+                params.map_or_else(|| ptr::null(), |p| p.raw)
+            )
+        };
+        if !larod_model_ptr.is_null() {
+            debug_assert!(
+                maybe_device_error.is_none(),
+                "larodLoadModel indicated success AND returned an error!"
+            );
+            Ok(InferenceModel {
+                session: session,
+                ptr: larod_model_ptr,
+                input_tensors: None,
+                num_inputs: 0,
+                output_tensors: None,
+                num_outputs: 0,
+                params: None,
+            })
+        } else {
+            Err(maybe_error.unwrap_or(Error::MissingLarodError))
+        }
+    }
     pub fn id() -> Result<()> {
         Ok(())
     }
