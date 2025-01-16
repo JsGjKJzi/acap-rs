@@ -48,6 +48,7 @@ use std::{
     marker::PhantomData,
     ops,
     os::fd::{AsFd, AsRawFd},
+    path::Path,
     ptr::{self},
 };
 
